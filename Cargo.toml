@@ -1,0 +1,24 @@
+[workspace]
+members = [
+    "crates/arc-pdf-core",
+    "crates/arc-pdf-render",
+    "crates/arc-pdf-engine",
+    "crates/arc-pdf-ui",
+    "crates/arc-pdf-app",
+    "crates/arc-pdf-cli",
+    "ffi/arc-pdfium-sys",
+]
+resolver = "2"
+exclude = ["vendor", "tools/vendor-sync"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Daniel Hu"]
+
+[workspace.lints.rust]
+unexpected_cfgs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

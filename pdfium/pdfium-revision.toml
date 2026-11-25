@@ -1,0 +1,106 @@
+# PDFium revision and target matrix.
+#
+# This file is the single source of truth for the PDFium source revision,
+# dependency revisions, GN args and supported build targets. The build script
+# must refuse to build when the manifest is inconsistent or incomplete.
+
+[pdfium]
+url = "https://pdfium.googlesource.com/pdfium.git"
+revision = "bc5820734ee8f94b68fed1093d8e6d7028155814"
+checkout_configuration = "minimal"
+target_os_override = [ "mac", "ios" ]
+
+[harfbuzz]
+enabled = false
+# revision = "ff36703b95013ec1d437e6038e1aa7c881275f4e"
+
+[gn.common]
+is_component_build = false
+is_debug = false
+pdf_enable_v8 = false
+pdf_enable_xfa = false
+pdf_is_standalone = true
+use_custom_libcxx = false
+pdf_is_complete_lib = true
+pdf_use_partition_alloc = false
+symbol_level = 0
+treat_warnings_as_errors = false
+clang_use_chrome_plugins = false
+
+[gn.apple]
+use_sysroot = false
+
+[gn.ios]
+ios_deployment_target = "17.0"
+ios_enable_code_signing = false
+use_blink = true
+use_custom_libcxx_for_host = false
+use_clang_modules = false
+
+[targets.macos_arm64]
+os = "mac"
+cpu = "arm64"
+status = "implemented"
+patches = []
+
+[targets.macos_x86_64]
+os = "mac"
+cpu = "x64"
+status = "implemented"
+patches = []
+
+[targets.windows_x86_64]
+os = "win"
+cpu = "x64"
+status = "reserved"
+patches = []
+
+[targets.windows_arm64]
+os = "win"
+cpu = "arm64"
+status = "reserved"
+patches = []
+
+[targets.linux_x86_64]
+os = "linux"
+cpu = "x64"
+status = "reserved"
+patches = []
+
+[targets.linux_arm64]
+os = "linux"
+cpu = "arm64"
+status = "reserved"
+patches = []
+
+[targets.android_arm64]
+os = "android"
+cpu = "arm64"
+status = "reserved"
+patches = []
+
+[targets.android_arm]
+os = "android"
+cpu = "arm"
+status = "reserved"
+patches = []
+
+[targets.ios_device_arm64]
+os = "ios"
+cpu = "arm64"
+status = "reserved"
+environment = "device"
+patches = []
+
+[targets.ios_simulator_arm64]
+os = "ios"
+cpu = "arm64"
+status = "reserved"
+environment = "simulator"
+patches = []
+
+[artifacts]
+root = "artifacts/pdfium"
+headers_subdir = "include"
+lib_filename = "libpdfium.a"
+manifest = "manifest.json"

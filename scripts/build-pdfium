@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""PDFium multi-target build entry point.
+
+Workflow:
+  scripts/build-pdfium sync                 fetch/update a gitignored checkout
+  scripts/build-pdfium update-revision ...  pin a newer PDFium revision
+  scripts/build-pdfium --target macos_arm64 build from the pinned checkout
+
+`sync` is explicit: normal builds never pull sources silently.
+Phase 1-B implements real source sync, patch checking, GN generation, ninja
+build, artifact collection and manifest generation for implemented targets.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError as exc:  # pragma: no cover - depends on Python version
+    raise SystemExit("Python 3.11+ is required for tomllib") from exc
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST_PATH = ROOT / "pdfium" / "pdfium-revision.toml"
+PATCH_DIR = ROOT / "pdfium" / "patches"
+DEFAULT_SOURCE_DIR = ROOT / "build" / "pdfium"
+DEFAULT_DEPOT_TOOLS = ROOT / "build" / "depot_tools"
+
+REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def load_manifest() -> dict:
+    with MANIFEST_PATH.open("rb") as fh:
+        return tomllib.load(fh)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    print(f"+ {' '.join(cmd)}" + (f" (cwd={cwd})" if cwd else ""))
+    subprocess.run(cmd, cwd=cwd, env=env, check=True)
+
+
+def gclient_env(depot_tools: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PATH"] = f"{depot_tools}:{env.get('PATH','')}"
+    env["DEPOT_TOOLS_UPDATE"] = "0"
+    return env
+
+
+def ensure_depot_tools(depot_tools: Path) -> None:
+    if depot_tools.exists():
+        return
+    depot_tools.parent.mkdir(parents=True, exist_ok=True)
+    run(["git", "clone", "-q", "https://chromium.googlesource.com/chromium/tools/depot_tools.git", str(depot_tools)])
+
+
+def ensure_gclient_config(manifest: dict, source_dir: Path, depot_tools: Path) -> None:
+    host_workspace = source_dir.parent
+    host_workspace.mkdir(parents=True, exist_ok=True)
+    gclient_file = host_workspace / ".gclient"
+    if gclient_file.exists():
+        return
+    run(["gclient", "config", "--unmanaged", manifest["pdfium"]["url"],
+         "--custom-var", f"checkout_configuration={manifest['pdfium'].get('checkout_configuration','minimal')}"],
+        cwd=host_workspace, env=gclient_env(depot_tools))
+    with gclient_file.open("a", encoding="utf-8") as fh:
+        target_os = manifest["pdfium"].get("target_os_override", [])
+        target_os_csv = ", ".join(f"'{name}'" for name in target_os)
+        fh.write(f"target_os = [ {target_os_csv} ]\n")
+
+
+def source_head(source_dir: Path) -> str | None:
+    if not (source_dir / ".git").exists():
+        return None
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source_dir, text=True
+    ).strip()
+
+
+def sync_source(manifest: dict, source_dir: Path, depot_tools: Path) -> None:
+    """Explicit sync to the revision pinned in pdfium-revision.toml."""
+    revision = manifest["pdfium"]["revision"]
+    ensure_depot_tools(depot_tools)
+    ensure_gclient_config(manifest, source_dir, depot_tools)
+    # The workspace is disposable and gitignored. --force is deliberate: any
+    # customization must live in pdfium/patches, never in this checkout.
+    run(["gclient", "sync", "--force", "--shallow", "--no-history", "--revision", revision],
+        cwd=source_dir.parent, env=gclient_env(depot_tools))
+    head = source_head(source_dir)
+    if head != revision:
+        raise SystemExit(f"PDFium revision mismatch after sync: expected {revision}, got {head}")
+    print(f"PDFium source ready: {source_dir} @ {head}")
+
+
+def verify_source(manifest: dict, source_dir: Path) -> str:
+    revision = manifest["pdfium"]["revision"]
+    head = source_head(source_dir)
+    if head is None:
+        raise SystemExit(
+            f"PDFium checkout missing at {source_dir}. Run: scripts/build-pdfium sync"
+        )
+    if head != revision:
+        raise SystemExit(
+            f"PDFium revision mismatch: expected {revision}, got {head}. "
+            "Run: scripts/build-pdfium sync"
+        )
+    return head
+
+
+def update_revision(revision: str, latest: bool, source_dir: Path, depot_tools: Path) -> int:
+    if latest:
+        ensure_depot_tools(depot_tools)
+        head = subprocess.check_output(
+            ["git", "ls-remote", manifest_url(), "HEAD"], text=True
+        ).splitlines()[0].split("\t")[0]
+        revision = head.strip()
+    if not REVISION_RE.match(revision):
+        raise SystemExit(f"invalid revision: {revision}")
+    text = MANIFEST_PATH.read_text(encoding="utf-8")
+    updated, count = re.subn(
+        r'(?m)^(revision\s*=\s*)"[0-9a-f]{40}"$',
+        f'\\1"{revision}"',
+        text,
+    )
+    if count != 1:
+        raise SystemExit(f"expected one revision field, found {count}")
+    MANIFEST_PATH.write_text(updated, encoding="utf-8")
+    print(f"updated {MANIFEST_PATH} to revision {revision}")
+    if latest:
+        print("now run: scripts/build-pdfium sync && scripts/build-pdfium --target macos_arm64")
+    return 0
+
+
+def manifest_url() -> str:
+    return load_manifest()["pdfium"]["url"]
+
+
+def gn_args_for(manifest: dict, target: str) -> dict[str, object]:
+    cfg = manifest["targets"][target]
+    args = dict(manifest.get("gn", {}).get("common", {}))
+
+    os_name = cfg["os"]
+    if os_name in {"mac", "ios"}:
+        args.update(manifest.get("gn", {}).get("apple", {}))
+    if os_name == "ios":
+        args.update(manifest.get("gn", {}).get("ios", {}))
+
+    args["target_os"] = os_name
+    args["target_cpu"] = cfg["cpu"]
+    if cfg.get("environment"):
+        args["target_environment"] = cfg["environment"]
+
+    return args
+
+
+def format_gn_args(args: dict[str, object]) -> str:
+    parts: list[str] = []
+    for key in sorted(args):
+        value = args[key]
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, list):
+            rendered = "[" + ",".join(json.dumps(v) for v in value) + "]"
+        else:
+            rendered = json.dumps(value)
+        parts.append(f"{key}={rendered}")
+    return " ".join(parts)
+
+
+def target_plan(manifest: dict, target: str, source_dir: Path) -> dict[str, object]:
+    cfg = manifest["targets"][target]
+    artifact_root = ROOT / manifest.get("artifacts", {}).get("root", "artifacts/pdfium")
+    artifact_dir = artifact_root / target
+    args = gn_args_for(manifest, target)
+    return {
+        "target": target,
+        "status": cfg.get("status", "reserved"),
+        "pdfium_revision": manifest["pdfium"]["revision"],
+        "source_url": manifest["pdfium"]["url"],
+        "gn_args": args,
+        "gn_args_string": format_gn_args(args),
+        "artifact_dir": str(artifact_dir),
+        "headers_dir": str(artifact_dir / manifest.get("artifacts", {}).get("headers_subdir", "include")),
+        "lib_path": str(artifact_dir / manifest.get("artifacts", {}).get("lib_filename", "libpdfium.a")),
+        "patches": cfg.get("patches", []),
+        "out_dir": str(artifact_dir / "out"),
+        "source_dir": str(source_dir),
+    }
+
+
+def check_tools() -> dict[str, str]:
+    names = ["git", "python3", "gn", "ninja", "clang++"]
+    result: dict[str, str] = {}
+    for name in names:
+        found = shutil.which(name)
+        result[name] = found or "MISSING"
+    return result
+
+
+def apply_patches(manifest: dict, target: str, source_dir: Path) -> list[str]:
+    patches = manifest["targets"][target].get("patches", [])
+    applied: list[str] = []
+    for name in patches:
+        patch = PATCH_DIR / name
+        if not patch.exists():
+            raise SystemExit(f"missing patch: {patch}")
+        run(["git", "apply", "--check", str(patch)], cwd=source_dir)
+        run(["git", "apply", str(patch)], cwd=source_dir)
+        applied.append(name)
+    return applied
+
+
+def collect_headers(source_dir: Path, headers_dir: Path) -> None:
+    headers_dir.mkdir(parents=True, exist_ok=True)
+    public_dir = source_dir / "public"
+    for header in public_dir.glob("*.h"):
+        shutil.copy2(header, headers_dir / header.name)
+
+
+def write_manifest(plan: dict, manifest: dict, lib_path: Path, headers_dir: Path,
+                   applied_patches: list[str], out_dir: Path, manifest_path: Path,
+                   source_dirty: list[str]) -> None:
+    lib_sha = sha256_file(lib_path) if lib_path.exists() else None
+    header_files = sorted(headers_dir.glob("*.h")) if headers_dir.exists() else []
+    headers_sha = {header.name: sha256_file(header) for header in header_files}
+    data = {
+        "schema_version": 2,
+        "target": plan["target"],
+        "pdfium": {
+            "url": manifest["pdfium"]["url"],
+            "revision": manifest["pdfium"]["revision"],
+        },
+        "harfbuzz": manifest.get("harfbuzz", {}),
+        "gn_args": plan["gn_args"],
+        "gn_args_string": plan["gn_args_string"],
+        "patches": applied_patches,
+        "source_worktree_dirty": source_dirty,
+        "artifacts": {
+            "lib": str(lib_path.relative_to(ROOT)),
+            "lib_sha256": lib_sha,
+            "headers_dir": str(headers_dir.relative_to(ROOT)),
+            "headers_sha256": headers_sha,
+        },
+        "out_dir": str(out_dir.relative_to(ROOT)),
+        "manifest_sha256_source": sha256_file(MANIFEST_PATH),
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def git_dirty_files(source_dir: Path) -> list[str]:
+    result = subprocess.check_output(
+        ["git", "status", "--porcelain"], cwd=source_dir, text=True
+    ).splitlines()
+    return [line.strip() for line in result if line.strip()]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--list-targets", action="store_true")
+    parser.add_argument("--target", help="target name from pdfium-revision.toml")
+    parser.add_argument("--dry-run", action="store_true", help="print build plan only")
+    parser.add_argument("--check-tools", action="store_true")
+    parser.add_argument("--manifest-info", action="store_true")
+    parser.add_argument("command", nargs="?", choices=["sync", "update-revision"],
+                        help="explicit source maintenance command")
+    parser.add_argument("--latest", action="store_true",
+                        help="with update-revision: query remote HEAD and pin it")
+    parser.add_argument("--revision", help="with update-revision: explicit 40-hex revision")
+    parser.add_argument("--depot-tools", default=str(DEFAULT_DEPOT_TOOLS),
+                        help="depot_tools directory (created if missing)")
+    parser.add_argument("--gn", default=None, help="path to gn binary")
+    parser.add_argument("--source-dir", default=None,
+                        help="PDFium checkout (default: build/pdfium-src, gitignored)")
+    args = parser.parse_args()
+
+    manifest = load_manifest()
+    depot_tools = Path(args.depot_tools).resolve()
+    source_dir = Path(args.source_dir).resolve() if args.source_dir else DEFAULT_SOURCE_DIR
+
+    if args.manifest_info:
+        print(json.dumps({
+            "path": str(MANIFEST_PATH),
+            "sha256": sha256_file(MANIFEST_PATH),
+            "revision": manifest["pdfium"]["revision"],
+            "source_dir": str(source_dir),
+            "depot_tools": str(depot_tools),
+        }, indent=2, sort_keys=True))
+        return 0
+
+    if args.list_targets:
+        for name, cfg in manifest["targets"].items():
+            print(f"{name}\t{cfg.get('status', 'reserved')}\t{cfg['os']}/{cfg['cpu']}")
+        return 0
+
+    if args.check_tools:
+        print(json.dumps(check_tools(), indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "update-revision":
+        if args.latest == bool(args.revision):
+            parser.error("update-revision requires exactly one of --latest or --revision")
+        return update_revision(args.revision or "", args.latest, source_dir, depot_tools)
+
+    if args.command == "sync":
+        sync_source(manifest, source_dir, depot_tools)
+        return 0
+
+    if not args.target:
+        parser.error("--target is required unless a command or info flag is used")
+
+    if args.target not in manifest["targets"]:
+        print(f"unknown target: {args.target}", file=sys.stderr)
+        return 2
+
+    plan = target_plan(manifest, args.target, source_dir)
+    print(json.dumps(plan, indent=2, sort_keys=True))
+
+    if plan["status"] != "implemented":
+        print(f"target {args.target} is reserved but not implemented", file=sys.stderr)
+        return 3
+
+    if args.dry_run:
+        return 0
+
+    gn = args.gn or shutil.which("gn")
+    if not gn or not Path(gn).exists():
+        print("gn not found; pass --gn or install in PATH", file=sys.stderr)
+        return 2
+    ninja = shutil.which("ninja")
+    if not ninja:
+        print("ninja not found in PATH", file=sys.stderr)
+        return 2
+
+    head = verify_source(manifest, source_dir)
+    print(f"using source: {source_dir} @ {head}")
+    source_dirty = git_dirty_files(source_dir)
+    if source_dirty:
+        print("WARNING: source worktree has local modifications:", file=sys.stderr)
+        for line in source_dirty:
+            print(f"  {line}", file=sys.stderr)
+        print("These will be recorded in the artifact manifest.", file=sys.stderr)
+
+    applied_patches = apply_patches(manifest, args.target, source_dir)
+    artifact_dir = ROOT / manifest.get("artifacts", {}).get("root", "artifacts/pdfium") / args.target
+    out_dir = artifact_dir / "out"
+    headers_dir = artifact_dir / manifest.get("artifacts", {}).get("headers_subdir", "include")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    args_string = str(plan["gn_args_string"])
+    run([gn, "gen", str(out_dir), f"--root={source_dir}", f"--args={args_string}"])
+    run([ninja, "-C", str(out_dir), "pdfium"])
+
+    built_lib = out_dir / "obj" / "libpdfium.a"
+    if not built_lib.exists():
+        raise SystemExit(f"expected PDFium static library not found: {built_lib}")
+    final_lib = artifact_dir / manifest.get("artifacts", {}).get("lib_filename", "libpdfium.a")
+    shutil.copy2(built_lib, final_lib)
+    collect_headers(source_dir, headers_dir)
+
+    write_manifest(plan, manifest, final_lib, headers_dir, applied_patches, out_dir,
+                   artifact_dir / manifest.get("artifacts", {}).get("manifest", "manifest.json"),
+                   source_dirty)
+    print(f"PDFium build complete: {final_lib}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

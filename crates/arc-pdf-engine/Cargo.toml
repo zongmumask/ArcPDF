@@ -1,0 +1,13 @@
+[package]
+name = "arc-pdf-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+arc-pdf-core = { path = "../../crates/arc-pdf-core" }
+arc-pdfium-sys = { path = "../../ffi/arc-pdfium-sys" }
+
+[lints]
+workspace = true
