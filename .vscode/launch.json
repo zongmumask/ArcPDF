@@ -1,0 +1,69 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Arc PDF: LibraryWindow",
+      "cargo": {
+        "args": ["build", "-p", "arc-pdf-app", "--bin", "arc-pdf-app"],
+        "filter": {
+          "name": "arc-pdf-app",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "ARCPDF_PDFIUM_TARGET": "macos_arm64"
+      },
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Arc PDF: Open PDF",
+      "cargo": {
+        "args": ["build", "-p", "arc-pdf-app", "--bin", "arc-pdf-app"],
+        "filter": {
+          "name": "arc-pdf-app",
+          "kind": "bin"
+        }
+      },
+      "args": ["artifacts/test-fixtures/smoke.pdf"],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "ARCPDF_PDFIUM_TARGET": "macos_arm64"
+      },
+      "sourceLanguages": ["rust"]
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Arc PDF CLI: Render Page",
+      "cargo": {
+        "args": ["build", "-p", "arc-pdf-cli", "--bin", "arc-pdf-cli"],
+        "filter": {
+          "name": "arc-pdf-cli",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "render",
+        "--pdf",
+        "artifacts/test-fixtures/smoke.pdf",
+        "--page",
+        "0",
+        "--scale",
+        "1.5",
+        "--out",
+        "${workspaceFolder}/artifacts/test-fixtures/smoke-page-vscode.png"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "ARCPDF_PDFIUM_TARGET": "macos_arm64"
+      },
+      "sourceLanguages": ["rust"]
+    }
+  ]
+}

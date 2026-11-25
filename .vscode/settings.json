@@ -1,0 +1,14 @@
+{
+  "lldb.library": "/Users/danielhu/.trae-cn/extensions/vadimcn.vscode-lldb-1.12.3/lldb/lib/liblldb.dylib",
+  "rust-analyzer.linkedProjects": [
+    "Cargo.toml"
+  ],
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.allTargets": true,
+  "rust-analyzer.check.extraArgs": [
+    "--locked",
+    "--",
+    "-D",
+    "warnings"
+  ]
+}

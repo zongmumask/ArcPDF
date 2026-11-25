@@ -49,8 +49,25 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def step(title: str, icon: str = "▶") -> None:
+    """ArcPDFium-style stage banner without a fixed total step count."""
+    print(f"\n{icon} {title}", flush=True)
+
+
+def ok(message: str) -> None:
+    print(f"✅ {message}", flush=True)
+
+
+def info(message: str) -> None:
+    print(f"   {message}", flush=True)
+
+
+def fail(message: str) -> None:
+    print(f"❌ {message}", file=sys.stderr, flush=True)
+
+
 def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
-    print(f"+ {' '.join(cmd)}" + (f" (cwd={cwd})" if cwd else ""))
+    print(f"+ {' '.join(cmd)}" + (f" (cwd={cwd})" if cwd else ""), flush=True)
     subprocess.run(cmd, cwd=cwd, env=env, check=True)
 
 
@@ -277,15 +294,15 @@ def main() -> int:
     parser.add_argument("--check-tools", action="store_true")
     parser.add_argument("--manifest-info", action="store_true")
     parser.add_argument("command", nargs="?", choices=["sync", "update-revision"],
-                        help="explicit source maintenance command")
-    parser.add_argument("--latest", action="store_true",
-                        help="with update-revision: query remote HEAD and pin it")
-    parser.add_argument("--revision", help="with update-revision: explicit 40-hex revision")
+                        help="advanced explicit source maintenance command")
+    parser.add_argument("--update", action="store_true",
+                        help="query latest PDFium HEAD, pin it, sync, then build")
+    parser.add_argument("--revision", help="pin this 40-hex revision, sync, then build")
     parser.add_argument("--depot-tools", default=str(DEFAULT_DEPOT_TOOLS),
                         help="depot_tools directory (created if missing)")
     parser.add_argument("--gn", default=None, help="path to gn binary")
     parser.add_argument("--source-dir", default=None,
-                        help="PDFium checkout (default: build/pdfium-src, gitignored)")
+                        help="PDFium checkout (default: build/pdfium, gitignored)")
     args = parser.parse_args()
 
     manifest = load_manifest()
@@ -312,62 +329,110 @@ def main() -> int:
         return 0
 
     if args.command == "update-revision":
-        if args.latest == bool(args.revision):
-            parser.error("update-revision requires exactly one of --latest or --revision")
-        return update_revision(args.revision or "", args.latest, source_dir, depot_tools)
+        if args.revision is None:
+            parser.error("update-revision requires --revision <40-hex>")
+        return update_revision(args.revision, False, source_dir, depot_tools)
 
     if args.command == "sync":
         sync_source(manifest, source_dir, depot_tools)
         return 0
 
-    if not args.target:
-        parser.error("--target is required unless a command or info flag is used")
+    # Always validate the combination; --dry-run only prevents execution.
+    if args.update and args.revision is not None:
+        parser.error("use exactly one of --update or --revision <40-hex> for a versioned build")
 
-    if args.target not in manifest["targets"]:
-        print(f"unknown target: {args.target}", file=sys.stderr)
+    # 步骤 1：读取 manifest 与目标配置。后续步骤可增加，不再写死总数。
+    target = args.target or "macos_arm64"
+    step(f"读取构建配置 ({target})" + (" · dry-run" if args.dry_run else ""), "📖")
+
+    # 步骤 2：可选更新 PDFium revision；普通构建只检查当前源码。
+    versioned_build = args.update or args.revision is not None
+    if versioned_build and not args.dry_run:
+        step("更新 PDFium revision", "🔄")
+        requested_revision = "<remote HEAD>" if args.update else args.revision
+        update_revision(requested_revision, args.update, source_dir, depot_tools)
+        step("同步 PDFium 源码", "📥")
+        manifest = load_manifest()
+        sync_source(manifest, source_dir, depot_tools)
+    elif not versioned_build and not args.dry_run:
+        step("检查 PDFium 源码", "🔍")
+        head = source_head(source_dir)
+        if head != manifest["pdfium"]["revision"]:
+            step("源码缺失或版本不符，自动同步", "📥")
+            sync_source(manifest, source_dir, depot_tools)
+        else:
+            ok(f"复用现有源码 @ {head}")
+    else:
+        info("dry-run：跳过源码同步与检查")
+
+    if target not in manifest["targets"]:
+        fail(f"unknown target: {target}")
         return 2
 
-    plan = target_plan(manifest, args.target, source_dir)
-    print(json.dumps(plan, indent=2, sort_keys=True))
+    # 步骤 3：输出构建计划，确认 revision / GN args / 产物路径。
+    plan = target_plan(manifest, target, source_dir)
+    print(json.dumps(plan, indent=2, sort_keys=True), flush=True)
 
     if plan["status"] != "implemented":
-        print(f"target {args.target} is reserved but not implemented", file=sys.stderr)
+        fail(f"target {target} is reserved but not implemented")
         return 3
 
     if args.dry_run:
+        ok("dry-run complete")
         return 0
 
+    # 步骤 4：检查 gn/ninja 工具链。
+    step("检查工具链", "🛠️")
     gn = args.gn or shutil.which("gn")
     if not gn or not Path(gn).exists():
-        print("gn not found; pass --gn or install in PATH", file=sys.stderr)
+        fail("gn not found; pass --gn or install in PATH")
         return 2
     ninja = shutil.which("ninja")
     if not ninja:
-        print("ninja not found in PATH", file=sys.stderr)
+        fail("ninja not found in PATH")
         return 2
+    ok(f"gn = {gn}")
+    ok(f"ninja = {ninja}")
 
+    # 步骤 5：确认源码 revision，并记录工作区本地改动。
+    step("校验源码与工作区状态", "🔎")
     head = verify_source(manifest, source_dir)
-    print(f"using source: {source_dir} @ {head}")
+    ok(f"using source: {source_dir} @ {head}")
     source_dirty = git_dirty_files(source_dir)
     if source_dirty:
-        print("WARNING: source worktree has local modifications:", file=sys.stderr)
+        fail("source worktree has local modifications; they will be recorded in the manifest")
         for line in source_dirty:
-            print(f"  {line}", file=sys.stderr)
-        print("These will be recorded in the artifact manifest.", file=sys.stderr)
+            info(line)
+    else:
+        ok("source worktree clean")
 
-    applied_patches = apply_patches(manifest, args.target, source_dir)
-    artifact_dir = ROOT / manifest.get("artifacts", {}).get("root", "artifacts/pdfium") / args.target
+    # 步骤 6：应用 checked-in patches（当前默认为空）。
+    patch_count = len(manifest["targets"][target].get("patches", []))
+    step(f"应用 patch（{patch_count} 个）", "🧩")
+    applied_patches = apply_patches(manifest, target, source_dir)
+    if applied_patches:
+        ok("applied: " + ", ".join(applied_patches))
+    else:
+        info("no patches configured")
+
+    artifact_dir = ROOT / manifest.get("artifacts", {}).get("root", "artifacts/pdfium") / target
     out_dir = artifact_dir / "out"
     headers_dir = artifact_dir / manifest.get("artifacts", {}).get("headers_subdir", "include")
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    # 步骤 7：gn gen + ninja pdfium。
     args_string = str(plan["gn_args_string"])
+    step(f"gn gen -> {out_dir}", "⚙️")
     run([gn, "gen", str(out_dir), f"--root={source_dir}", f"--args={args_string}"])
+    step("ninja pdfium", "🔨")
     run([ninja, "-C", str(out_dir), "pdfium"])
 
+    # 步骤 8：收集 lib/headers 并写出机器可读 manifest。
+    step("收集产物并写入 manifest", "📦")
     built_lib = out_dir / "obj" / "libpdfium.a"
     if not built_lib.exists():
-        raise SystemExit(f"expected PDFium static library not found: {built_lib}")
+        fail(f"expected PDFium static library not found: {built_lib}")
+        return 2
     final_lib = artifact_dir / manifest.get("artifacts", {}).get("lib_filename", "libpdfium.a")
     shutil.copy2(built_lib, final_lib)
     collect_headers(source_dir, headers_dir)
@@ -375,7 +440,7 @@ def main() -> int:
     write_manifest(plan, manifest, final_lib, headers_dir, applied_patches, out_dir,
                    artifact_dir / manifest.get("artifacts", {}).get("manifest", "manifest.json"),
                    source_dirty)
-    print(f"PDFium build complete: {final_lib}")
+    ok(f"PDFium build complete: {final_lib}")
     return 0
 
 

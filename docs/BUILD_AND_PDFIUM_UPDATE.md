@@ -20,6 +20,66 @@
 
 ---
 
+## 0.1 扩展源码与 PDFium patch 的区别
+
+这里必须区分两类完全不同的代码，避免混淆。
+
+### 扩展源码（Arc 自己的代码，不是 patch）
+
+扩展源码是我们自己维护的 C/C++/Rust 代码，通常位于：
+
+```text
+ffi/arc-pdfium-ext/        # 未来迁移扩展方法的 crate
+ffi/arc-pdfium-sys/        # bindgen 生成的 public C API binding
+```
+
+它们的特点是：
+
+- 是我们自己的源码，正常进 git、正常参与 workspace/CI。
+- 通过 `extern "C"` 暴露类似 `FPDFExt_*`、`FPDF_FFLDrawWithMatrix` 的 C API。
+- 调用 PDFium public API，必要时引用 PDFium 内部 C++ 头/helper。
+- **不修改 PDFium 源码树。**
+- 改扩展源码时不需要重新编译 PDFium 内核，只需要重编扩展 crate。
+
+这正是“预构建内核 + 消费者侧扩展源码”里“扩展源码”的部分。
+
+### PDFium patch（修改上游源码，必须 checked-in）
+
+PDFium patch 指的是**直接修改 PDFium 上游源码/构建文件**的改动，例如：
+
+```text
+core/fxge/BUILD.gn
+testing/test.gni
+core/.../*.cpp
+core/.../*.h
+```
+
+这些改动不能留在本地 `build/pdfium` 工作树，因为该目录是 gitignored 且 disposable，`scripts/build-pdfium sync --force` 会覆盖它。
+
+所有这类改动必须保存为：
+
+```text
+pdfium/patches/0001-xxx.patch
+pdfium/patches/0002-xxx.patch
+```
+
+并由 `scripts/build-pdfium --target ...` 通过 `git apply --check` 和 `git apply` 自动应用。
+
+### 分类表
+
+| 内容 | 放哪里 | 是否 PDFium patch | 是否需要重编 PDFium |
+|---|---|---|---|
+| 自己写的 `FPDFExt_*` C API | `ffi/arc-pdfium-ext` | 否 | 否 |
+| public API 的 Rust binding | `ffi/arc-pdfium-sys` | 否 | 否 |
+| 为兼容新 PDFium 修改我们自己的扩展源码 | `ffi/arc-pdfium-ext` | 否 | 否 |
+| 修改 PDFium `BUILD.gn` | `pdfium/patches/*.patch` | 是 | 是 |
+| 修改 PDFium `core/.../*.cpp/.h` | `pdfium/patches/*.patch` | 是 | 是 |
+| 修改 PDFium iOS GN/构建配置 | `pdfium/patches/*.patch` | 是 | 是 |
+
+当前状态：`pdfium/patches/` 为空，macOS arm64 构建不需要任何 PDFium patch。ArcPDFium 现有的 iOS 相关修改只有在未来做 iOS 构建时才需要 patch 化。
+
+---
+
 ## 1. 新电脑环境搭建
 
 ### 1.1 必需工具
@@ -76,32 +136,40 @@ crates/                      # Rust workspace
 
 ## 2. 首次拉取源码与构建 PDFium
 
-### 2.1 同步源码
+### 2.1 一条命令完成构建
 
 ```bash
 cd <ArcPDF repo>
-python3 scripts/build-pdfium sync
+scripts/build-pdfium
 ```
 
-行为：
+默认等价于：
 
-- 若 `build/depot_tools` 不存在，克隆 depot_tools。
-- 若 `build/.gclient` 不存在，按 `pdfium-revision.toml` 创建。
-- 用 gclient 把 PDFium 同步到 manifest 固定 revision。
-- 源码落在 `build/pdfium/`，该目录 gitignored。
+```bash
+scripts/build-pdfium --target macos_arm64
+```
+
+脚本会自动完成整个流程：
+
+1. 读取 `pdfium/pdfium-revision.toml`。
+2. 若 `build/depot_tools` 不存在，克隆 depot_tools。
+3. 若 `build/pdfium` 不存在，或其 HEAD 与 manifest revision 不符，自动 gclient sync。
+4. `git apply --check` / 应用 `pdfium/patches/` 中的 patch。
+5. `gn gen`。
+6. `ninja pdfium`。
+7. 复制 `libpdfium.a` 和 public headers。
+8. 写入 manifest。
+
+因此日常使用不需要先手动执行 `sync` 再执行 build。`sync` 和 `update-revision` 仍保留为高级命令，但正常开发不必直接调用。
+
+源码落在 `build/pdfium/`，该目录 gitignored、可丢弃、可重建。
 
 说明：
 
-- `sync` 使用 `--force`，因为源码工作区是 disposable 的；任何人工修改必须 patch 化到 `pdfium/patches/`。
-- 如果本地已有 `build/pdfium`，sync 会把工作区更新到当前 revision。
+- 内部 gclient sync 使用 `--force`，因为源码工作区是 disposable 的；任何人工修改必须 patch 化到 `pdfium/patches/`。
+- 如果本地源码已存在且 revision 正确，构建过程不会联网。
 
-### 2.2 构建 macOS arm64
-
-```bash
-python3 scripts/build-pdfium --target macos_arm64
-```
-
-产物：
+### 2.2 构建产物
 
 ```text
 artifacts/pdfium/macos_arm64/libpdfium.a
@@ -197,59 +265,58 @@ GUI 需要 macOS 图形会话与 Metal Toolchain。
 
 建议节奏：**默认每两个月一次，遇到安全修复或内部 API 不兼容时立即升级。**
 
-### 4.1 选择新 revision
+### 4.1 一键升级并构建（推荐）
 
-查询远端 HEAD：
-
-```bash
-git ls-remote https://pdfium.googlesource.com/pdfium.git HEAD
-```
-
-或直接指定某个 40-hex SHA。
-
-### 4.2 更新 manifest
-
-自动追最新 HEAD：
+查询最新 HEAD、更新 manifest、同步源码、重新构建 macOS arm64：
 
 ```bash
-python3 scripts/build-pdfium update-revision --latest
+scripts/build-pdfium --update
 ```
 
-指定 revision：
+指定某个 40-hex SHA：
 
 ```bash
-python3 scripts/build-pdfium update-revision --revision <40-hex-sha>
+scripts/build-pdfium --revision <40-hex-sha>
 ```
 
-### 4.3 同步新源码
+这两条命令等价于：
+
+```text
+更新 revision → gclient sync → git apply patches → gn gen → ninja → 写 manifest
+```
+
+也就是说，用户不需要手动执行 `update-revision` + `sync` + build 三个步骤。
+
+### 4.2 高级手动步骤（通常不需要）
+
+如果需要拆分调试，仍可显式调用：
 
 ```bash
-python3 scripts/build-pdfium sync
+scripts/build-pdfium update-revision --revision <40-hex-sha>
+scripts/build-pdfium sync
+scripts/build-pdfium --target macos_arm64
 ```
 
-### 4.4 检查 patch
+### 4.3 patch 检查
 
-如果 `pdfium/patches/` 有 patch：
+如果 `pdfium/patches/` 有 patch，构建脚本会自动执行：
 
 ```bash
-git -C build/pdfium apply --check pdfium/patches/<patch>
+git apply --check <patch>
+git apply <patch>
 ```
 
-脚本会在 build 时自动执行 `git apply --check` 和应用。patch 失败必须修复，不允许把修改留在本地源码树里。
+patch 失败必须修复，不允许把修改留在本地源码树里。
 
-### 4.5 重新构建产物
+### 4.4 需要同时构建 x86_64
 
 ```bash
-python3 scripts/build-pdfium --target macos_arm64
+scripts/build-pdfium --target macos_x86_64
 ```
 
-如果还需要 x86_64：
+注意：如果上一步已经通过 `--update`/`--revision` 更新了 manifest，此命令会使用同一个新 revision。
 
-```bash
-python3 scripts/build-pdfium --target macos_x86_64
-```
-
-### 4.6 验证
+### 4.5 验证
 
 ```bash
 scripts/check.sh
@@ -299,35 +366,34 @@ target/
 
 ## 6. 常见问题
 
-### 6.1 `PDFium checkout missing`
+### 6.1 源码缺失或 revision 不匹配
+
+正常 `scripts/build-pdfium` 会自动处理。只有手动拆分流程时才会看到：
 
 ```text
 PDFium checkout missing at .../build/pdfium. Run: scripts/build-pdfium sync
+PDFium revision mismatch
 ```
 
 执行：
 
 ```bash
-python3 scripts/build-pdfium sync
+scripts/build-pdfium
 ```
 
-### 6.2 `PDFium revision mismatch`
+或直接重新跑一次构建即可；脚本会在需要时自动 sync。
 
-manifest revision 与本地源码 HEAD 不一致。执行：
-
-```bash
-python3 scripts/build-pdfium sync
-```
-
-### 6.3 gclient `gsutil` lock error
+### 6.2 gclient `gsutil` lock error
 
 如果多个 gclient 同时运行，可能锁冲突。确认无残留进程后重试：
 
 ```bash
-python3 scripts/build-pdfium sync
+scripts/build-pdfium
 ```
 
-### 6.4 Metal shader 编译失败
+不需要单独 sync。
+
+### 6.3 Metal shader 编译失败
 
 ```text
 missing Metal Toolchain; use: xcodebuild -downloadComponent MetalToolchain
